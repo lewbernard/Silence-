@@ -8,7 +8,7 @@ from dataset import SignLanguageDataset
 from model import SignLanguageMLP
 
 # 1. Load the dataset
-full_dataset = SignLanguageDataset("dummy_data.csv")
+full_dataset = SignLanguageDataset("asl_dataset(ABC).csv")
 
 # 2. Split into 80% Training (Study Deck) and 20% Validation (Unseen Exam Deck)
 train_size = int(0.8 * len(full_dataset))
@@ -20,7 +20,7 @@ train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
 val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
 
 # 3. Initialize the blank brain, the penalty meter (Loss), and the knob turner (Optimizer)
-model = SignLanguageMLP(input_size=63, num_classes=26)
+model = SignLanguageMLP(input_size=63, num_classes=3)
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.Adam(model.parameters(), lr=0.001)
 
