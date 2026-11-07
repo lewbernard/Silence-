@@ -1,71 +1,117 @@
+from pathlib import Path
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset
 
-# Import the classes we built in our other two files
-from dataset import SignLanguageDataset
-from model import SignLanguageMLP
+from sequence_dataset import NUM_CLASSES, SEQUENCE_CSV, SignSequenceDataset
+from sequence_model import SignSequenceModel
 
-NUM_CLASSES = 26
 
-# 1. Load the dataset
-full_dataset = SignLanguageDataset("asl_dataset.csv")
+MODEL_PATH = Path(__file__).resolve().with_name("asl_sequence_model_fast.pth")
+BATCH_SIZE = 32
+NUM_EPOCHS = 30
 
-# 2. Split into 80% Training (Study Deck) and 20% Validation (Unseen Exam Deck)
-train_size = int(0.8 * len(full_dataset))
-val_size = len(full_dataset) - train_size
-train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
 
-# Create the conveyor belts (DataLoaders) that hand out 32 samples at a time
-train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+def split_by_class(labels):
+    rng = np.random.default_rng(42)
+    train_indices = []
+    validation_indices = []
+    counts = np.bincount(labels, minlength=NUM_CLASSES)
 
-# 3. Initialize the blank brain, the penalty meter (Loss), and the knob turner (Optimizer)
-model = SignLanguageMLP(input_size=63, num_classes=NUM_CLASSES)
-criterion = nn.CrossEntropyLoss()
-optimizer = optim.Adam(model.parameters(), lr=0.001)
+    missing = [chr(index + ord("A")) for index, count in enumerate(counts) if count == 0]
+    if missing:
+        raise ValueError(
+            "The sequence dataset is missing examples for: "
+            + ", ".join(missing)
+            + ". Record sequences for all 26 letters before training."
+        )
 
-# 4. Run the Training Loop for 30 Epochs (30 full passes through the study deck)
-num_epochs = 30
+    for label, count in enumerate(counts):
+        if count < 2:
+            letter = chr(label + ord("A"))
+            raise ValueError(
+                f"Need at least 2 recorded sequences for {letter}; found {count}."
+            )
 
-print("Starting training on CPU...")
-for epoch in range(num_epochs):
-    # --- PHASE A: STUDY SESSION (TRAINING) ---
-    model.train()  # Put the model in training mode
-    running_loss = 0.0
-    
-    for features, labels in train_loader:
-        optimizer.zero_grad()               # Step 1: Clear old calculations from the previous batch
-        outputs = model(features)           # Step 2: Forward pass (one score per letter)
-        loss = criterion(outputs, labels)   # Step 3: Calculate the penalty score (Loss)
-        loss.backward()                     # Step 4: Backpropagation (find which knobs caused the error)
-        optimizer.step()                    # Step 5: Turn the knobs slightly to reduce future errors
-        
-        running_loss += loss.item()
-        
-    avg_train_loss = running_loss / len(train_loader)
-    
-    # --- PHASE B: UNSEEN EXAM (VALIDATION) ---
-    model.eval()   # Freeze the model switches for testing
-    correct = 0
-    total = 0
-    
-    # torch.no_grad() turns off the calculus engine to save CPU memory during testing
-    with torch.no_grad():
-        for features, labels in val_loader:
-            outputs = model(features)
-            # Pick whichever letter has the highest score
-            _, predicted_letter = torch.max(outputs, dim=1)
-            total += labels.size(0)
-            correct += (predicted_letter == labels).sum().item()
-            
-    val_accuracy = (correct / total) * 100
-    
-    # Print progress every 5 epochs
-    if (epoch + 1) % 5 == 0 or epoch == 0:
-        print(f"Epoch [{epoch+1:2d}/{num_epochs}] | Training Loss: {avg_train_loss:.4f} | Validation Accuracy: {val_accuracy:.2f}%")
+        indices = np.flatnonzero(labels == label)
+        rng.shuffle(indices)
+        validation_count = max(1, round(count * 0.2))
+        validation_indices.extend(indices[:validation_count])
+        train_indices.extend(indices[validation_count:])
 
-# 5. Freeze and save the trained knobs into a file for Member 3's webcam script
-torch.save(model.state_dict(), "asl_model.pth")
-print("\nTraining complete! Saved trained model weights to asl_model.pth")
+    return train_indices, validation_indices, counts
+
+
+def main():
+    dataset_path = Path(__file__).resolve().with_name(SEQUENCE_CSV)
+    dataset = SignSequenceDataset(dataset_path)
+    train_indices, validation_indices, counts = split_by_class(
+        dataset.labels.numpy()
+    )
+
+    print(f"Loaded {len(dataset)} gesture sequences from {dataset_path.name}.")
+    print("Examples per letter:", ", ".join(
+        f"{chr(index + ord('A'))}:{count}" for index, count in enumerate(counts)
+    ))
+    if counts.min() < 20:
+        print(
+            "Warning: some letters have fewer than 20 examples; "
+            "collecting more balanced examples may improve recognition."
+        )
+
+    train_loader = DataLoader(
+        Subset(dataset, train_indices),
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+    )
+    validation_loader = DataLoader(
+        Subset(dataset, validation_indices),
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+    )
+
+    model = SignSequenceModel(num_classes=NUM_CLASSES)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+    print("Starting 26-letter sequence training on CPU...")
+    for epoch in range(NUM_EPOCHS):
+        model.train()
+        running_loss = 0.0
+
+        for sequences, labels in train_loader:
+            optimizer.zero_grad()
+            outputs = model(sequences)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item()
+
+        model.eval()
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for sequences, labels in validation_loader:
+                outputs = model(sequences)
+                predictions = outputs.argmax(dim=1)
+                total += labels.size(0)
+                correct += (predictions == labels).sum().item()
+
+        validation_accuracy = 100 * correct / total
+        if (epoch + 1) % 5 == 0 or epoch == 0:
+            average_loss = running_loss / len(train_loader)
+            print(
+                f"Epoch [{epoch + 1:2d}/{NUM_EPOCHS}] | "
+                f"Training Loss: {average_loss:.4f} | "
+                f"Validation Accuracy: {validation_accuracy:.2f}%"
+            )
+
+    torch.save(model.state_dict(), MODEL_PATH)
+    print(f"\nTraining complete! Saved sequence model to {MODEL_PATH.name}.")
+
+
+if __name__ == "__main__":
+    main()

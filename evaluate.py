@@ -1,45 +1,41 @@
-import os
+from pathlib import Path
+
 import torch
-import numpy as np
-from torch.utils.data import DataLoader
 from sklearn.metrics import classification_report, confusion_matrix
+from torch.utils.data import DataLoader
 
-from dataset import SignLanguageDataset
-from model import SignLanguageMLP
-
-NUM_CLASSES = 26
-LETTERS = [chr(i) for i in range(ord('A'), ord('Z') + 1)]
+from predict import LETTERS, MODEL_PATH
+from sequence_dataset import NUM_CLASSES, SEQUENCE_CSV, SignSequenceDataset
+from sequence_model import SignSequenceModel
 
 
-def evaluate_model():
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    csv_path = os.path.join(base_dir, "asl_dataset.csv")
-    model_path = os.path.join(base_dir, "asl_model.pth")
+def main():
+    dataset_path = Path(__file__).resolve().with_name(SEQUENCE_CSV)
+    if not MODEL_PATH.is_file():
+        raise FileNotFoundError(
+            f"Sequence model not found: {MODEL_PATH}. Run train.py first."
+        )
 
-    dataset = SignLanguageDataset(csv_path)
+    dataset = SignSequenceDataset(dataset_path)
     loader = DataLoader(dataset, batch_size=32, shuffle=False)
-
-    # Initialize the 26-class model blueprint
-    model = SignLanguageMLP(input_size=63, num_classes=NUM_CLASSES)
-    model.load_state_dict(torch.load(model_path, weights_only=True))
+    model = SignSequenceModel(num_classes=NUM_CLASSES)
+    model.load_state_dict(
+        torch.load(MODEL_PATH, map_location="cpu", weights_only=True)
+    )
     model.eval()
 
-    all_preds = []
-    all_labels = []
-
+    predictions = []
+    labels = []
     with torch.no_grad():
-        for features, labels in loader:
-            outputs = model(features)
-            _, predicted = torch.max(outputs, dim=1)
-            all_preds.extend(predicted.numpy())
-            all_labels.extend(labels.numpy())
+        for sequences, batch_labels in loader:
+            predictions.extend(model(sequences).argmax(dim=1).tolist())
+            labels.extend(batch_labels.tolist())
 
-    print("\n--- PER-LETTER DIAGNOSTIC REPORT ---")
-    # The grader now uses exactly 3 target names, avoiding the ValueError
+    print("\n--- PER-LETTER SEQUENCE REPORT ---")
     print(
         classification_report(
-            all_labels,
-            all_preds,
+            labels,
+            predictions,
             labels=range(NUM_CLASSES),
             target_names=LETTERS,
             digits=3,
@@ -47,23 +43,31 @@ def evaluate_model():
         )
     )
 
-    cm = confusion_matrix(all_labels, all_preds, labels=range(NUM_CLASSES))
+    matrix = confusion_matrix(labels, predictions, labels=range(NUM_CLASSES))
     confused_pairs = []
-
-    for true_idx in range(NUM_CLASSES):
-        for pred_idx in range(NUM_CLASSES):
-            if true_idx != pred_idx and cm[true_idx, pred_idx] > 0:
-                count = cm[true_idx, pred_idx]
-                confused_pairs.append((count, LETTERS[true_idx], LETTERS[pred_idx]))
-
-    confused_pairs.sort(reverse=True)
+    for true_index in range(NUM_CLASSES):
+        for predicted_index in range(NUM_CLASSES):
+            if true_index != predicted_index and matrix[true_index, predicted_index]:
+                confused_pairs.append(
+                    (
+                        matrix[true_index, predicted_index],
+                        LETTERS[true_index],
+                        LETTERS[predicted_index],
+                    )
+                )
 
     print("--- TOP CONFUSED LETTER PAIRS ---")
     if not confused_pairs:
-        print("Zero confused letters! The model distinguished all signs perfectly.")
+        print("No confused letter pairs in this dataset.")
     else:
-        for count, true_let, pred_let in confused_pairs[:10]:
-            print(f"True Letter '{true_let}' was mistaken for '{pred_let}' -> {count} times")
+        for count, true_letter, predicted_letter in sorted(
+            confused_pairs, reverse=True
+        )[:10]:
+            print(
+                f"True '{true_letter}' mistaken for '{predicted_letter}' "
+                f"-> {count} times"
+            )
+
 
 if __name__ == "__main__":
-    evaluate_model()
+    main()
