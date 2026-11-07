@@ -9,14 +9,31 @@ from hand_tracking import (
     draw_hand_landmarks,
 )
 from predict import SignPredictor
-from sequence_dataset import NUM_FRAMES, landmarks_to_features
+from sequence_dataset import (
+    NUM_FRAMES,
+    add_velocity_features,
+    landmarks_to_features,
+)
 
 
 STABLE_PREDICTION_SECONDS = 0.6
 HAND_RELEASE_SECONDS = 0.35
 SAMPLE_INTERVAL_SECONDS = 1 / 15
+PREDICTION_SMOOTHING_WINDOWS = 5
 SCROLL_SPEED_PIXELS_PER_SECOND = 120
 FONT = cv2.FONT_HERSHEY_SIMPLEX
+
+
+class PredictionSmoother:
+    def __init__(self, window_size):
+        self.probability_history = deque(maxlen=window_size)
+
+    def reset(self):
+        self.probability_history.clear()
+
+    def update(self, probabilities):
+        self.probability_history.append(probabilities)
+        return sum(self.probability_history) / len(self.probability_history)
 
 
 class LetterSequence:
@@ -109,6 +126,7 @@ def main():
     scroll_offset = 0.0
     sequence = LetterSequence()
     frame_buffer = deque(maxlen=NUM_FRAMES)
+    prediction_smoother = PredictionSmoother(PREDICTION_SMOOTHING_WINDOWS)
     current_letter = None
     current_confidence = 0.0
     results = None
@@ -143,12 +161,24 @@ def main():
                         )
 
                         if len(frame_buffer) == NUM_FRAMES:
-                            current_letter, current_confidence = predictor.predict(
+                            model_features = add_velocity_features(
                                 list(frame_buffer)
+                            )
+                            probabilities = predictor.predict_probabilities(
+                                model_features
+                            )
+                            smoothed_probabilities = prediction_smoother.update(
+                                probabilities
+                            )
+                            predicted_index = int(smoothed_probabilities.argmax())
+                            current_letter = chr(ord("A") + predicted_index)
+                            current_confidence = float(
+                                smoothed_probabilities[predicted_index] * 100
                             )
                             sequence.observe(current_letter, now)
                     else:
                         frame_buffer.clear()
+                        prediction_smoother.reset()
                         current_letter = None
                         current_confidence = 0.0
                         sequence.observe(None, now)

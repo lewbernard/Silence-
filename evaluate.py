@@ -2,11 +2,12 @@ from pathlib import Path
 
 import torch
 from sklearn.metrics import classification_report, confusion_matrix
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 from predict import LETTERS, MODEL_PATH
 from sequence_dataset import NUM_CLASSES, SEQUENCE_CSV, SignSequenceDataset
-from sequence_model import SignSequenceModel
+from sequence_model import create_sequence_model
+from train import split_by_session
 
 
 def main():
@@ -17,11 +18,17 @@ def main():
         )
 
     dataset = SignSequenceDataset(dataset_path)
-    loader = DataLoader(dataset, batch_size=32, shuffle=False)
-    model = SignSequenceModel(num_classes=NUM_CLASSES)
-    model.load_state_dict(
-        torch.load(MODEL_PATH, map_location="cpu", weights_only=True)
+    _, validation_indices, _ = split_by_session(
+        dataset.labels.numpy(), dataset.session_ids
     )
+    loader = DataLoader(
+        Subset(dataset, validation_indices), batch_size=32, shuffle=False
+    )
+    checkpoint = torch.load(MODEL_PATH, map_location="cpu", weights_only=True)
+    model = create_sequence_model(
+        checkpoint["architecture"], num_classes=NUM_CLASSES
+    )
+    model.load_state_dict(checkpoint["state_dict"])
     model.eval()
 
     predictions = []
@@ -31,7 +38,7 @@ def main():
             predictions.extend(model(sequences).argmax(dim=1).tolist())
             labels.extend(batch_labels.tolist())
 
-    print("\n--- PER-LETTER SEQUENCE REPORT ---")
+    print("\n--- HELD-OUT SESSION PER-LETTER REPORT ---")
     print(
         classification_report(
             labels,

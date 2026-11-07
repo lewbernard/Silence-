@@ -1,15 +1,22 @@
 import csv
 import time
+import uuid
 from pathlib import Path
 
 import cv2
+import numpy as np
 
 from hand_tracking import (
     create_hand_landmarker,
     detect_hand_landmarks,
     draw_hand_landmarks,
 )
-from sequence_dataset import NUM_FRAMES, SEQUENCE_CSV, landmarks_to_features
+from sequence_dataset import (
+    NUM_FRAMES,
+    SEQUENCE_CSV,
+    add_velocity_features,
+    landmarks_to_features,
+)
 
 
 CSV_PATH = Path(__file__).resolve().with_name(SEQUENCE_CSV)
@@ -25,6 +32,7 @@ def main():
         raise RuntimeError("Could not open webcam.")
 
     last_timestamp_ms = 0
+    session_id = uuid.uuid4().hex
     selected_label = None
     countdown_end = None
     capture_deadline = None
@@ -38,7 +46,11 @@ def main():
                 "Press A-Z to record one example. Hold static letters; "
                 "draw the full motion for moving letters."
             )
-            print("Record examples for every letter; press '/' to quit.")
+            print(
+                "Record every letter in each session. Run this script again "
+                "for a separate validation session."
+            )
+            print("Press '/' to quit.")
 
             while cap.isOpened():
                 ret, frame = cap.read()
@@ -92,14 +104,22 @@ def main():
                             )
 
                         if len(frames) == NUM_FRAMES:
+                            sequence = add_velocity_features(
+                                np.asarray(frames, dtype=np.float32),
+                                sample_rate=SAMPLE_RATE,
+                            )
                             row = [selected_label]
-                            row.extend(value for values in frames for value in values)
+                            row.append(session_id)
+                            row.extend(value for values in sequence for value in values)
                             with CSV_PATH.open(
                                 mode="a", newline="", encoding="utf-8"
                             ) as csv_file:
                                 csv.writer(csv_file).writerow(row)
                             letter = chr(selected_label + ord("A"))
-                            print(f"Saved {letter} sequence ({NUM_FRAMES} frames).")
+                            print(
+                                f"Saved {letter} sequence ({NUM_FRAMES} frames, "
+                                f"session {session_id[:8]})."
+                            )
                             selected_label = None
                             capture_deadline = None
                             frames = []
