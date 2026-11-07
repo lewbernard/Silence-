@@ -1,66 +1,72 @@
-import cv2
 import csv
-import mediapipe as mp
+import time
+from pathlib import Path
 
-CSV_FILE = 'asl_dataset.csv'
+import cv2
 
-# Use the working import style from your webcam.py
-mp_hands = mp.solutions.hands
-mp_drawing = mp.solutions.drawing_utils
-
-hands = mp_hands.Hands(
-    static_image_mode=False,
-    max_num_hands=1,
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5
+from hand_tracking import (
+    create_hand_landmarker,
+    detect_hand_landmarks,
+    draw_hand_landmarks,
+    landmarks_to_csv_row,
 )
 
-cap = cv2.VideoCapture(0)
 
-print("Milestone 3: Strict ML Formatting Active!")
-print("Hold a sign and press letters 'a' to 'z' to log samples (A=0, B=1...).")
-print("Press 'q' to quit.")
+CSV_FILE = Path(__file__).resolve().with_name("asl_dataset.csv")
 
-while cap.isOpened():
-    ret, frame = cap.read()
-    if not ret:
-        break
 
-    frame = cv2.flip(frame, 1)
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    
-    # Process the frame to find hands
-    results = hands.process(rgb_frame)
+def main():
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        cap.release()
+        raise RuntimeError("Could not open webcam.")
 
-    key = cv2.waitKey(1) & 0xFF
+    last_timestamp_ms = 0
+    try:
+        with create_hand_landmarker() as hand_landmarker:
+            print("Milestone 3: Strict ML Formatting Active!")
+            print("Hold a sign and press letters 'a' to 'z' to log samples (A=0, B=1...).")
+            print("Press '/' to quit.")
 
-    # RULE 4: Failed Detections Filtered Out
-    if results.multi_hand_landmarks:
-        for hand_landmarks in results.multi_hand_landmarks:
-            mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    break
 
-            # Check if a letter key (a-z) was pressed
-            if ord('a') <= key <= ord('z'):
-                
-                # RULE 2: Column 0 is the Integer Label (A=0, B=1, C=2...)
-                integer_label = key - ord('a')
-                row = [integer_label]
+                frame = cv2.flip(frame, 1)
+                timestamp_ms = max(
+                    time.monotonic_ns() // 1_000_000,
+                    last_timestamp_ms + 1,
+                )
+                last_timestamp_ms = timestamp_ms
+                results = detect_hand_landmarks(hand_landmarker, frame, timestamp_ms)
+                key = cv2.waitKey(1) & 0xFF
 
-                # RULE 3: Columns 1 to 63 Order (x0, y0, z0, x1, y1, z1...)
-                for lm in hand_landmarks.landmark:
-                    row.extend([lm.x, lm.y, lm.z])
+                if results.hand_landmarks:
+                    draw_hand_landmarks(frame, results)
 
-                # RULE 1: No Header Row (appending directly)
-                with open(CSV_FILE, mode='a', newline='') as f:
-                    writer = csv.writer(f)
-                    writer.writerow(row)
-                
-                print(f"Logged sample for '{chr(key).upper()}' as label [{integer_label}]")
+                    if ord("a") <= key <= ord("z"):
+                        integer_label = key - ord("a")
+                        row = landmarks_to_csv_row(
+                            integer_label, results.hand_landmarks[0]
+                        )
 
-    cv2.imshow('ASL Data Collection - Milestone 3', frame)
+                        with CSV_FILE.open(mode="a", newline="") as csv_file:
+                            csv.writer(csv_file).writerow(row)
 
-    if key == ord('q'):
-        break
+                        print(
+                            f"Logged sample for '{chr(key).upper()}' "
+                            f"as label [{integer_label}]"
+                        )
 
-cap.release()
-cv2.destroyAllWindows()
+                cv2.imshow("ASL Data Collection - Milestone 3", frame)
+
+                if key == ord("/"):
+                    break
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()

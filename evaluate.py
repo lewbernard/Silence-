@@ -7,21 +7,19 @@ from sklearn.metrics import classification_report, confusion_matrix
 from dataset import SignLanguageDataset
 from model import SignLanguageMLP
 
-# Limit the classes to 3 to match Member 1's current data (A, B, C)
-NUM_CLASSES = 3
-# Slices the alphabet list to only include ['A', 'B', 'C']
-LETTERS = [chr(i) for i in range(ord('A'), ord('Z') + 1)][:NUM_CLASSES]
+NUM_CLASSES = 26
+LETTERS = [chr(i) for i in range(ord('A'), ord('Z') + 1)]
+
 
 def evaluate_model():
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    # Ensure this points to Member 1's actual CSV file
-    csv_path = os.path.join(base_dir, "asl_dataset(ABC).csv")
+    csv_path = os.path.join(base_dir, "asl_dataset.csv")
     model_path = os.path.join(base_dir, "asl_model.pth")
 
     dataset = SignLanguageDataset(csv_path)
     loader = DataLoader(dataset, batch_size=32, shuffle=False)
 
-    # Initialize the 3-class model blueprint
+    # Initialize the 26-class model blueprint
     model = SignLanguageMLP(input_size=63, num_classes=NUM_CLASSES)
     model.load_state_dict(torch.load(model_path, weights_only=True))
     model.eval()
@@ -38,12 +36,20 @@ def evaluate_model():
 
     print("\n--- PER-LETTER DIAGNOSTIC REPORT ---")
     # The grader now uses exactly 3 target names, avoiding the ValueError
-    print(classification_report(all_labels, all_preds, target_names=LETTERS, digits=3))
+    print(
+        classification_report(
+            all_labels,
+            all_preds,
+            labels=range(NUM_CLASSES),
+            target_names=LETTERS,
+            digits=3,
+            zero_division=0,
+        )
+    )
 
-    cm = confusion_matrix(all_labels, all_preds)
+    cm = confusion_matrix(all_labels, all_preds, labels=range(NUM_CLASSES))
     confused_pairs = []
 
-    # Limit the matrix scanner to a 3x3 grid instead of 26x26
     for true_idx in range(NUM_CLASSES):
         for pred_idx in range(NUM_CLASSES):
             if true_idx != pred_idx and cm[true_idx, pred_idx] > 0:

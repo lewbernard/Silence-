@@ -7,8 +7,10 @@ from torch.utils.data import DataLoader, random_split
 from dataset import SignLanguageDataset
 from model import SignLanguageMLP
 
+NUM_CLASSES = 26
+
 # 1. Load the dataset
-full_dataset = SignLanguageDataset("asl_dataset(ABC).csv")
+full_dataset = SignLanguageDataset("asl_dataset.csv")
 
 # 2. Split into 80% Training (Study Deck) and 20% Validation (Unseen Exam Deck)
 train_size = int(0.8 * len(full_dataset))
@@ -20,7 +22,7 @@ train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
 val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
 
 # 3. Initialize the blank brain, the penalty meter (Loss), and the knob turner (Optimizer)
-model = SignLanguageMLP(input_size=63, num_classes=3)
+model = SignLanguageMLP(input_size=63, num_classes=NUM_CLASSES)
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.Adam(model.parameters(), lr=0.001)
 
@@ -35,7 +37,7 @@ for epoch in range(num_epochs):
     
     for features, labels in train_loader:
         optimizer.zero_grad()               # Step 1: Clear old calculations from the previous batch
-        outputs = model(features)           # Step 2: Forward pass (make a guess of 26 scores)
+        outputs = model(features)           # Step 2: Forward pass (one score per letter)
         loss = criterion(outputs, labels)   # Step 3: Calculate the penalty score (Loss)
         loss.backward()                     # Step 4: Backpropagation (find which knobs caused the error)
         optimizer.step()                    # Step 5: Turn the knobs slightly to reduce future errors
@@ -53,7 +55,7 @@ for epoch in range(num_epochs):
     with torch.no_grad():
         for features, labels in val_loader:
             outputs = model(features)
-            # Pick whichever of the 26 slots has the highest confidence score
+            # Pick whichever letter has the highest score
             _, predicted_letter = torch.max(outputs, dim=1)
             total += labels.size(0)
             correct += (predicted_letter == labels).sum().item()

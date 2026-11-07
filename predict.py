@@ -13,7 +13,7 @@ class SignPredictor:
         model_path = os.path.join(base_dir, model_filename)
         
         # 1. Build the blank brain blueprint
-        self.model = SignLanguageMLP(input_size=63, num_classes=3)
+        self.model = SignLanguageMLP(input_size=63, num_classes=len(LETTERS))
         
         # 2. Load the frozen, trained knob settings from your saved file
         self.model.load_state_dict(torch.load(model_path, weights_only=True))
