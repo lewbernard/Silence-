@@ -135,7 +135,7 @@ def main():
                         f"{len(frames)}/{NUM_FRAMES} frames"
                     )
                 else:
-                    status = "Press A-Z to record | q to quit"
+                    status = "Press A-Z to record | / to quit"
 
                 cv2.putText(
                     frame,
