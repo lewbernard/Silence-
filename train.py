@@ -1,3 +1,4 @@
+import math
 from pathlib import Path
 
 import numpy as np
@@ -13,7 +14,7 @@ from sequence_model import create_sequence_model
 
 MODEL_PATH = Path(__file__).resolve().with_name("asl_motion_model.pth")
 BATCH_SIZE = 32
-NUM_EPOCHS = 30
+NUM_EPOCHS = 65
 ARCHITECTURES = ("gru", "temporal_cnn")
 
 
@@ -38,7 +39,10 @@ def split_by_session(labels, session_ids):
             "Run collect_data.py again and record all 26 letters in each run."
         )
 
-    splitter = GroupShuffleSplit(n_splits=200, test_size=0.2, random_state=42)
+    splitter = GroupShuffleSplit(n_splits=500, test_size=0.2, random_state=42)
+    best_split = None
+    best_score = float("inf")
+
     for train_indices, validation_indices in splitter.split(
         np.zeros(len(labels)), labels, groups=session_ids
     ):
@@ -47,7 +51,18 @@ def split_by_session(labels, session_ids):
             labels[validation_indices], minlength=NUM_CLASSES
         )
         if np.all(train_counts > 0) and np.all(validation_counts > 0):
-            return train_indices, validation_indices, class_counts
+            # Pick the session split closest to an 80/20 sample ratio
+            # that maximizes the minimum training examples per letter
+            val_ratio = len(validation_indices) / len(labels)
+            ratio_penalty = abs(val_ratio - 0.22)
+            min_train_penalty = 1.0 / max(int(train_counts.min()), 1)
+            score = ratio_penalty + min_train_penalty
+            if score < best_score:
+                best_score = score
+                best_split = (train_indices, validation_indices, class_counts)
+
+    if best_split is not None:
+        return best_split
 
     raise ValueError(
         "Could not make a session-separated split containing every letter in "
@@ -56,11 +71,71 @@ def split_by_session(labels, session_ids):
     )
 
 
-def train_architecture(architecture, train_loader, validation_loader):
+def augment_batch(sequences):
+    """Applies mild 3D wrist/camera tilt, timing shifts, scaling, and jitter."""
+    batch_size, num_frames, num_features = sequences.shape
+    device = sequences.device
+
+    # 1. Temporal shift (-1 to +1 frames) to preserve fast Z/J trajectories
+    shift = int(torch.randint(-1, 2, (1,)).item())
+    if shift > 0 and num_frames > shift:
+        pad = sequences[:, :1, :].expand(-1, shift, -1)
+        sequences = torch.cat([pad, sequences[:, :-shift, :]], dim=1)
+    elif shift < 0 and num_frames > -shift:
+        s = -shift
+        pad = sequences[:, -1:, :].expand(-1, s, -1)
+        sequences = torch.cat([sequences[:, s:, :], pad], dim=1)
+
+    # 2. 3D Hand & Camera Tilt Rotation across all 44 (x, y, z) vectors
+    vectors = sequences.view(batch_size, num_frames, 44, 3)
+
+    # Z-axis rotation: in-plane wrist tilt (+/- 12 degrees)
+    theta_z = torch.empty(batch_size, device=device).uniform_(
+        -math.radians(12), math.radians(12)
+    )
+    cos_z, sin_z = torch.cos(theta_z), torch.sin(theta_z)
+    rot_z = torch.stack([
+        torch.stack([cos_z, -sin_z, torch.zeros_like(cos_z)], dim=-1),
+        torch.stack([sin_z,  cos_z, torch.zeros_like(cos_z)], dim=-1),
+        torch.stack([torch.zeros_like(cos_z), torch.zeros_like(cos_z), torch.ones_like(cos_z)], dim=-1),
+    ], dim=-2)
+
+    # Y-axis rotation: horizontal camera angle turn (+/- 10 degrees)
+    theta_y = torch.empty(batch_size, device=device).uniform_(
+        -math.radians(10), math.radians(10)
+    )
+    cos_y, sin_y = torch.cos(theta_y), torch.sin(theta_y)
+    rot_y = torch.stack([
+        torch.stack([ cos_y, torch.zeros_like(cos_y), sin_y], dim=-1),
+        torch.stack([torch.zeros_like(cos_y), torch.ones_like(cos_y), torch.zeros_like(cos_y)], dim=-1),
+        torch.stack([-sin_y, torch.zeros_like(cos_y), cos_y], dim=-1),
+    ], dim=-2)
+
+    rot_matrix = torch.bmm(rot_z, rot_y)
+    vectors = torch.einsum("btvj,bjk->btvk", vectors, rot_matrix)
+    sequences = vectors.reshape(batch_size, num_frames, num_features)
+
+    # 3. Mild random scaling (+/- 8%) so O vs C gap stays crisp
+    scale = torch.empty((batch_size, 1, 1), device=device).uniform_(0.92, 1.08)
+    sequences = sequences * scale
+
+    # 4. Subtle sensor jitter
+    noise = torch.randn_like(sequences) * 0.005
+    return sequences + noise
+
+
+def train_architecture(architecture, train_loader, validation_loader, class_weights):
     torch.manual_seed(42)
     model = create_sequence_model(architecture, num_classes=NUM_CLASSES)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+    criterion = nn.CrossEntropyLoss(
+        weight=class_weights, label_smoothing=0.03
+    )
+    optimizer = optim.AdamW(model.parameters(), lr=0.0015, weight_decay=1e-2)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=NUM_EPOCHS, eta_min=1e-4
+    )
+
     best_accuracy = -1.0
     best_state = None
 
@@ -69,12 +144,17 @@ def train_architecture(architecture, train_loader, validation_loader):
         running_loss = 0.0
 
         for sequences, labels in train_loader:
+            sequences = augment_batch(sequences)
+
             optimizer.zero_grad()
             outputs = model(sequences)
             loss = criterion(outputs, labels)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             running_loss += loss.item()
+
+        scheduler.step()
 
         model.eval()
         correct = 0
@@ -95,10 +175,12 @@ def train_architecture(architecture, train_loader, validation_loader):
 
         if (epoch + 1) % 5 == 0 or epoch == 0:
             average_loss = running_loss / len(train_loader)
+            current_lr = optimizer.param_groups[0]["lr"]
             print(
                 f"Epoch [{epoch + 1:2d}/{NUM_EPOCHS}] | "
-                f"Training Loss: {average_loss:.4f} | "
-                f"Validation Accuracy: {validation_accuracy * 100:.2f}%"
+                f"Train Loss: {average_loss:.4f} | "
+                f"Val Acc: {validation_accuracy * 100:.2f}% | "
+                f"LR: {current_lr:.5f}"
             )
 
     return best_accuracy, best_state
@@ -113,6 +195,7 @@ def main():
 
     print(
         f"Loaded {len(dataset)} gesture sequences from {dataset_path.name} "
+        f"({len(train_indices)} train, {len(validation_indices)} val) "
         f"across {len(np.unique(dataset.session_ids))} recording sessions."
     )
     print(
@@ -122,11 +205,11 @@ def main():
             for index, count in enumerate(counts)
         ),
     )
-    if counts.min() < 20:
-        print(
-            "Warning: some letters have fewer than 20 examples; "
-            "collecting more varied examples should improve reliability."
-        )
+
+    train_labels = dataset.labels.numpy()[train_indices]
+    train_counts = np.bincount(train_labels, minlength=NUM_CLASSES).astype(np.float32)
+    weights = train_counts.sum() / (NUM_CLASSES * np.maximum(train_counts, 1.0))
+    class_weights = torch.tensor(np.power(weights, 0.75), dtype=torch.float32)
 
     train_loader = DataLoader(
         Subset(dataset, train_indices),
@@ -143,7 +226,7 @@ def main():
     for architecture in ARCHITECTURES:
         print(f"\nTraining {architecture}...")
         accuracy, state = train_architecture(
-            architecture, train_loader, validation_loader
+            architecture, train_loader, validation_loader, class_weights
         )
         results.append((accuracy, architecture, state))
         print(
