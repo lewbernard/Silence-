@@ -124,12 +124,14 @@ def augment_batch(sequences):
     return sequences + noise
 
 
-def train_architecture(architecture, train_loader, validation_loader, class_weights):
+def train_architecture(
+    architecture, train_loader, validation_loader, class_weights, device
+):
     torch.manual_seed(42)
-    model = create_sequence_model(architecture, num_classes=NUM_CLASSES)
+    model = create_sequence_model(architecture, num_classes=NUM_CLASSES).to(device)
 
     criterion = nn.CrossEntropyLoss(
-        weight=class_weights, label_smoothing=0.03
+        weight=class_weights.to(device), label_smoothing=0.03
     )
     optimizer = optim.AdamW(model.parameters(), lr=0.0015, weight_decay=1e-2)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
@@ -144,6 +146,8 @@ def train_architecture(architecture, train_loader, validation_loader, class_weig
         running_loss = 0.0
 
         for sequences, labels in train_loader:
+            sequences = sequences.to(device, non_blocking=device.type == "cuda")
+            labels = labels.to(device, non_blocking=device.type == "cuda")
             sequences = augment_batch(sequences)
 
             optimizer.zero_grad()
@@ -161,6 +165,10 @@ def train_architecture(architecture, train_loader, validation_loader, class_weig
         total = 0
         with torch.no_grad():
             for sequences, labels in validation_loader:
+                sequences = sequences.to(
+                    device, non_blocking=device.type == "cuda"
+                )
+                labels = labels.to(device, non_blocking=device.type == "cuda")
                 predictions = model(sequences).argmax(dim=1)
                 total += labels.size(0)
                 correct += (predictions == labels).sum().item()
@@ -187,6 +195,12 @@ def train_architecture(architecture, train_loader, validation_loader, class_weig
 
 
 def main():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        print(f"Training device: {torch.cuda.get_device_name(device)}")
+    else:
+        print("Training device: CPU")
+
     dataset_path = Path(__file__).resolve().with_name(SEQUENCE_CSV)
     dataset = SignSequenceDataset(dataset_path)
     train_indices, validation_indices, counts = split_by_session(
@@ -215,18 +229,20 @@ def main():
         Subset(dataset, train_indices),
         batch_size=BATCH_SIZE,
         shuffle=True,
+        pin_memory=device.type == "cuda",
     )
     validation_loader = DataLoader(
         Subset(dataset, validation_indices),
         batch_size=BATCH_SIZE,
         shuffle=False,
+        pin_memory=device.type == "cuda",
     )
 
     results = []
     for architecture in ARCHITECTURES:
         print(f"\nTraining {architecture}...")
         accuracy, state = train_architecture(
-            architecture, train_loader, validation_loader, class_weights
+            architecture, train_loader, validation_loader, class_weights, device
         )
         results.append((accuracy, architecture, state))
         print(

@@ -17,7 +17,14 @@ and
    `LICENSE.md` dedicates it to the public domain. The license text is included
    as `WORDLIST_LICENSE.md`.
 4. To train the model for ASL, run `collect_data.py` to collect sign-language
-   data, then run `train.py`.
+   data, then run `train.py`. Training automatically uses CUDA when available
+   and otherwise runs on the CPU.
+   To train in Google Colab, upload `train_colab.ipynb` to Colab, choose a GPU
+   runtime, and run the notebook cells. The upload cell prompts for
+   `train.py`, `sequence_dataset.py`, `sequence_model.py`, and
+   `asl_motion_sequence_dataset.csv` one at a time. The final cell downloads
+   `asl_motion_model.pth`. The dataset must contain all 26 letters recorded in
+   at least two separate sessions.
 5. To train a customized sign, run `webcam.py`, press `C`, enter your custom
    sign, and record it. Then run `custom_train.py`.
 6. To train thumbs-up recognition, run `collect_data.py`. Hold a thumbs-up
