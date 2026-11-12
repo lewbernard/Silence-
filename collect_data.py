@@ -13,9 +13,20 @@ from hand_tracking import (
 )
 from sequence_dataset import (
     NUM_FRAMES,
+    POSE_FEATURES_PER_FRAME,
     SEQUENCE_CSV,
     add_velocity_features,
     landmarks_to_features,
+)
+from thumb_gesture import (
+    MIN_CAPTURES_PER_CLASS,
+    OTHER_GESTURE_LABEL,
+    THUMB_DATASET_PATH,
+    THUMB_MODEL_PATH,
+    THUMB_UP_LABEL,
+    ThumbGestureClassifier,
+    append_capture,
+    train_thumb_classifier,
 )
 
 
@@ -23,6 +34,7 @@ CSV_PATH = Path(__file__).resolve().with_name(SEQUENCE_CSV)
 SAMPLE_RATE = 15
 COUNTDOWN_SECONDS = 0
 CAPTURE_TIMEOUT_SECONDS = 8
+THUMB_CAPTURE_SECONDS = 1
 
 
 def main():
@@ -34,10 +46,13 @@ def main():
     last_timestamp_ms = 0
     session_id = uuid.uuid4().hex
     selected_label = None
+    thumb_capture_label = None
     countdown_end = None
     capture_deadline = None
+    thumb_capture_deadline = None
     next_sample_at = 0.0
     frames = []
+    thumb_frames = []
 
     try:
         with create_hand_landmarker() as hand_landmarker:
@@ -49,6 +64,19 @@ def main():
             print(
                 "Record every letter in each session. Run this script again "
                 "for a separate validation session."
+            )
+            print(
+                "Train thumb detection: hold thumbs-up and press Space to "
+                "capture; show another hand pose and press 0 to capture a "
+                "negative example. Capture at least "
+                f"{MIN_CAPTURES_PER_CLASS} separate examples of each pose."
+            )
+            thumb_classifier = ThumbGestureClassifier()
+            print(
+                "A trained thumb classifier is loaded."
+                if thumb_classifier.model is not None
+                else f"No trained thumb model yet. It will be saved as "
+                f"{THUMB_MODEL_PATH.name}."
             )
             print("Press '/' to quit.")
 
@@ -71,7 +99,29 @@ def main():
                 if key == ord("/"):
                     break
 
-                if countdown_end is None and capture_deadline is None:
+                if (
+                    countdown_end is None
+                    and capture_deadline is None
+                    and thumb_capture_deadline is None
+                ):
+                    if key == ord(" "):
+                        thumb_capture_label = THUMB_UP_LABEL
+                        thumb_frames = []
+                        thumb_capture_deadline = now + THUMB_CAPTURE_SECONDS
+                        next_sample_at = now
+                        print("Capturing thumbs-up example...")
+                    elif key == ord("0"):
+                        thumb_capture_label = OTHER_GESTURE_LABEL
+                        thumb_frames = []
+                        thumb_capture_deadline = now + THUMB_CAPTURE_SECONDS
+                        next_sample_at = now
+                        print("Capturing other-pose example...")
+
+                if (
+                    countdown_end is None
+                    and capture_deadline is None
+                    and thumb_capture_deadline is None
+                ):
                     letter_key = key | 0x20
                     if ord("a") <= letter_key <= ord("z"):
                         selected_label = letter_key - ord("a")
@@ -124,6 +174,53 @@ def main():
                             capture_deadline = None
                             frames = []
 
+                if thumb_capture_deadline is not None:
+                    if now >= thumb_capture_deadline:
+                        if not thumb_frames:
+                            print(
+                                "No hand was detected; thumb example was not saved."
+                            )
+                        else:
+                            capture_id = append_capture(
+                                thumb_capture_label,
+                                thumb_frames,
+                                session_id,
+                                THUMB_DATASET_PATH,
+                            )
+                            label_name = (
+                                "thumbs-up"
+                                if thumb_capture_label == THUMB_UP_LABEL
+                                else "other pose"
+                            )
+                            print(
+                                f"Saved {label_name} capture "
+                                f"({len(thumb_frames)} frames, "
+                                f"{capture_id[:8]})."
+                            )
+                            try:
+                                counts = train_thumb_classifier()
+                            except ValueError as error:
+                                print(error)
+                            else:
+                                thumb_classifier = ThumbGestureClassifier()
+                                print(
+                                    "Trained thumb detector. Separate captures: "
+                                    f"other pose={counts[OTHER_GESTURE_LABEL]}, "
+                                    f"thumbs-up={counts[THUMB_UP_LABEL]}. "
+                                    f"Saved {THUMB_MODEL_PATH.name}."
+                                )
+                        thumb_capture_label = None
+                        thumb_capture_deadline = None
+                        thumb_frames = []
+                    elif now >= next_sample_at:
+                        next_sample_at = now + 1 / SAMPLE_RATE
+                        if results.hand_landmarks:
+                            thumb_frames.append(
+                                landmarks_to_features(
+                                    results.hand_landmarks[0]
+                                )[:POSE_FEATURES_PER_FRAME]
+                            )
+
                 if countdown_end is not None:
                     status = (
                         f"Get ready: {chr(selected_label + ord('A'))} "
@@ -134,8 +231,20 @@ def main():
                         f"Recording {chr(selected_label + ord('A'))}: "
                         f"{len(frames)}/{NUM_FRAMES} frames"
                     )
+                elif thumb_capture_deadline is not None:
+                    label = (
+                        "thumbs-up"
+                        if thumb_capture_label == THUMB_UP_LABEL
+                        else "other pose"
+                    )
+                    status = (
+                        f"Recording {label}: {len(thumb_frames)} frames"
+                    )
                 else:
-                    status = "Press A-Z to record | / to quit"
+                    status = (
+                        "A-Z: letter | Space: thumbs-up | "
+                        "0: other pose | /: quit"
+                    )
 
                 cv2.putText(
                     frame,

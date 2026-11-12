@@ -20,8 +20,14 @@ from hand_tracking import (
 from predict import SignPredictor
 from sequence_dataset import (
     NUM_FRAMES,
+    POSE_FEATURES_PER_FRAME,
     add_velocity_features,
     landmarks_to_features,
+)
+from thumb_gesture import ThumbGestureClassifier
+from word_prediction import (
+    WORD_DECISION_SECONDS,
+    WordPredictor,
 )
 
 
@@ -33,6 +39,7 @@ SCROLL_SPEED_PIXELS_PER_SECOND = 120
 CUSTOM_SIGN_RECORDINGS_PER_SESSION = 10
 CUSTOM_SIGN_CAPTURE_TIMEOUT_SECONDS = 8
 CUSTOM_SIGN_REST_SECONDS = 1.5
+THUMBS_UP_HOLD_SECONDS = 0.35
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 
 
@@ -50,6 +57,7 @@ class PredictionSmoother:
 
 class RecognizedSequence:
     def __init__(self):
+        self.confirmed_words = []
         self.letters = []
         self.candidate_letter = None
         self.candidate_since = None
@@ -58,7 +66,34 @@ class RecognizedSequence:
 
     @property
     def text(self):
-        return " ".join(self.letters)
+        items = list(self.confirmed_words)
+        if self.current_word:
+            items.append(self.current_word)
+        return " ".join(items)
+
+    @property
+    def current_word(self):
+        return "".join(self.letters).lower()
+
+    def confirm_word(self, word):
+        if not self.current_word or not word.startswith(self.current_word):
+            raise ValueError(
+                f"Confirmed word {word!r} does not match "
+                f"the current prefix {self.current_word!r}."
+            )
+        self.confirmed_words.append(word)
+        self.letters.clear()
+        self.candidate_letter = None
+        self.candidate_since = None
+        self.last_committed_letter = None
+
+    def keep_letters(self):
+        if self.current_word:
+            self.confirmed_words.append(self.current_word)
+            self.letters.clear()
+            self.candidate_letter = None
+            self.candidate_since = None
+            self.last_committed_letter = None
 
     def observe(self, letter, now):
         if letter is None:
@@ -68,24 +103,89 @@ class RecognizedSequence:
                 self.no_hand_since = now
             elif now - self.no_hand_since >= HAND_RELEASE_SECONDS:
                 self.last_committed_letter = None
-            return
+            return False
 
         self.no_hand_since = None
         if letter == self.last_committed_letter:
             self.candidate_letter = None
             self.candidate_since = None
-            return
+            return False
 
         if letter != self.candidate_letter:
             self.candidate_letter = letter
             self.candidate_since = now
-            return
+            return False
 
         if now - self.candidate_since >= STABLE_PREDICTION_SECONDS:
             self.letters.append(letter)
             self.last_committed_letter = letter
             self.candidate_letter = None
             self.candidate_since = None
+            return True
+        return False
+
+
+def is_thumbs_up(landmarks, classifier=None):
+    if len(landmarks) != 21:
+        return False
+
+    if classifier is not None and classifier.model is not None:
+        features = landmarks_to_features(landmarks)
+        return classifier.is_thumbs_up(features[:POSE_FEATURES_PER_FRAME])
+
+    thumb_is_raised = (
+        landmarks[4].y + 0.02 < landmarks[3].y
+        and landmarks[3].y < landmarks[2].y
+    )
+    other_fingers_are_folded = all(
+        landmarks[tip].y > landmarks[pip].y
+        for tip, pip in ((8, 6), (12, 10), (16, 14), (20, 18))
+    )
+    return thumb_is_raised and other_fingers_are_folded
+
+
+def draw_word_suggestion(frame, suggestion, deadline, now):
+    if deadline is None:
+        return
+
+    remaining = max(0.0, deadline - now)
+    height, width = frame.shape[:2]
+    panel_width = min(250, max(180, width // 3))
+    panel_height = 94
+    left = max(0, width - panel_width - 20)
+    top = max(90, height // 3)
+    cv2.rectangle(
+        frame,
+        (left, top),
+        (left + panel_width, top + panel_height),
+        (35, 35, 35),
+        -1,
+    )
+    cv2.putText(
+        frame, "Suggested word", (left + 12, top + 26), FONT, 0.55,
+        (220, 220, 220), 1, cv2.LINE_AA,
+    )
+    word_text = suggestion if suggestion else "No match"
+    cv2.putText(
+        frame,
+        word_text[:22],
+        (left + 12, top + 57),
+        FONT,
+        0.85,
+        (0, 255, 255) if suggestion else (150, 150, 150),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        frame,
+        f"Thumbs-up or next letter ({remaining:.1f}s)",
+        (left + 12, top + 82),
+        FONT,
+        0.36,
+        (220, 220, 220),
+        1,
+        cv2.LINE_AA,
+    )
 
 
 def draw_sign_sequence(frame, text, scroll_offset):
@@ -127,6 +227,8 @@ def draw_sign_sequence(frame, text, scroll_offset):
 
 def main():
     predictor = SignPredictor()
+    word_predictor = WordPredictor()
+    thumb_classifier = ThumbGestureClassifier()
     custom_signs = CustomSignLibrary()
     custom_classifier = CustomSignClassifier()
     cap = cv2.VideoCapture(0)
@@ -139,6 +241,10 @@ def main():
     next_detection_at = 0.0
     scroll_offset = 0.0
     sequence = RecognizedSequence()
+    active_suggestion = None
+    decision_deadline = None
+    thumbs_up_since = None
+    thumbs_up_handled = False
     frame_buffer = deque(maxlen=NUM_FRAMES)
     prediction_smoother = PredictionSmoother(PREDICTION_SMOOTHING_WINDOWS)
     current_letter = None
@@ -156,6 +262,22 @@ def main():
             print(
                 "Live 26-letter and custom-sign recognition active! "
                 "Press 'q' to quit."
+            )
+            print(
+                "Each recognized letter appears in the text buffer with one "
+                "word suggestion. Hold thumbs-up to confirm, sign the next "
+                "letter to update the suggestion, or wait 5 seconds to keep "
+                "the letters as typed."
+            )
+            print(
+                "Confirmed words are kept on screen and feedback is recorded "
+                "in word_feedback.jsonl for later training."
+            )
+            print(
+                "Using trained thumb gesture classifier."
+                if thumb_classifier.model is not None
+                else "No trained thumb model loaded; using the basic thumb pose "
+                "detector. Collect examples with collect_data.py to train one."
             )
             print(
                 f"Press 'c' to record a custom sign; its examples are saved to "
@@ -198,7 +320,14 @@ def main():
                         pose_features = landmarks_to_features(
                             results.hand_landmarks[0]
                         )
-                        frame_buffer.append(pose_features)
+                        thumbs_up_detected = (
+                            recording_label is None
+                            and is_thumbs_up(
+                                results.hand_landmarks[0], thumb_classifier
+                            )
+                        )
+                        if not thumbs_up_detected:
+                            frame_buffer.append(pose_features)
 
                         if (
                             recording_label is not None
@@ -265,7 +394,40 @@ def main():
                                         + CUSTOM_SIGN_CAPTURE_TIMEOUT_SECONDS
                                     )
 
-                        if len(frame_buffer) == NUM_FRAMES:
+                        if thumbs_up_detected:
+                            frame_buffer.clear()
+                            prediction_smoother.reset()
+                            current_letter = None
+                            current_confidence = 0.0
+                            current_is_custom = False
+                            sequence.observe(None, now)
+                            if thumbs_up_since is None:
+                                thumbs_up_since = now
+                            elif (
+                                not thumbs_up_handled
+                                and now - thumbs_up_since
+                                >= THUMBS_UP_HOLD_SECONDS
+                            ):
+                                if (
+                                    active_suggestion is not None
+                                    and decision_deadline is not None
+                                    and now < decision_deadline
+                                ):
+                                    word_predictor.record_confirmation(
+                                        sequence.current_word,
+                                        [active_suggestion],
+                                        active_suggestion,
+                                    )
+                                    sequence.confirm_word(active_suggestion)
+                                    print(f"Confirmed word: {active_suggestion}")
+                                    active_suggestion = None
+                                    decision_deadline = None
+                                thumbs_up_handled = True
+                        else:
+                            thumbs_up_since = None
+                            thumbs_up_handled = False
+
+                        if not thumbs_up_detected and len(frame_buffer) == NUM_FRAMES:
                             model_features = add_velocity_features(
                                 list(frame_buffer)
                             )
@@ -290,14 +452,31 @@ def main():
                                 )
                             else:
                                 current_confidence = 0.0
-                            sequence.observe(current_letter, now)
+                            if sequence.observe(current_letter, now):
+                                suggestions = word_predictor.suggest(
+                                    sequence.current_word, limit=1
+                                )
+                                active_suggestion = (
+                                    suggestions[0] if suggestions else None
+                                )
+                                decision_deadline = now + WORD_DECISION_SECONDS
                     else:
                         frame_buffer.clear()
                         prediction_smoother.reset()
                         current_letter = None
                         current_confidence = 0.0
                         current_is_custom = False
+                        thumbs_up_since = None
+                        thumbs_up_handled = False
                         sequence.observe(None, now)
+
+                if (
+                    decision_deadline is not None
+                    and now >= decision_deadline
+                ):
+                    sequence.keep_letters()
+                    active_suggestion = None
+                    decision_deadline = None
 
                 if recording_deadline is not None and now >= recording_deadline:
                     print(
@@ -333,10 +512,13 @@ def main():
                 elif results is None or not results.hand_landmarks:
                     display_text = "No hand detected"
                     color = (0, 165, 255)
+                elif sequence.current_word:
+                    display_text = f"Spelling: {sequence.current_word}"
+                    color = (0, 200, 255)
                 elif current_letter is None:
                     display_text = (
-                        f"Collecting gesture: {len(frame_buffer)}/{NUM_FRAMES} "
-                        "frames"
+                        f"Collecting gesture: {len(frame_buffer)}/"
+                        f"{NUM_FRAMES} frames"
                     )
                     color = (0, 200, 255)
                 else:
@@ -364,6 +546,10 @@ def main():
                     color,
                     2,
                     cv2.LINE_AA,
+                )
+
+                draw_word_suggestion(
+                    frame, active_suggestion, decision_deadline, now
                 )
 
                 (label_width, _), _ = cv2.getTextSize(
