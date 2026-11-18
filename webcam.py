@@ -1,5 +1,5 @@
 import time
-from collections import deque
+from collections import Counter, deque
 
 import cv2
 import numpy as np
@@ -40,6 +40,10 @@ CUSTOM_SIGN_RECORDINGS_PER_SESSION = 10
 CUSTOM_SIGN_CAPTURE_TIMEOUT_SECONDS = 8
 CUSTOM_SIGN_REST_SECONDS = 1.5
 THUMBS_UP_HOLD_SECONDS = 0.35
+NUMBER_SIGN_HOLD_SECONDS = 1.5
+NUMBER_SIGN_LABELS = frozenset("0123456789")
+NUMBER_LETTER_MATCH_THRESHOLD = 0.5
+DELETE_SIGN_LABEL = "delete"
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 
 
@@ -95,6 +99,27 @@ class RecognizedSequence:
             self.candidate_since = None
             self.last_committed_letter = None
 
+    def delete_previous(self):
+        if self.letters:
+            self.letters.pop()
+        elif self.confirmed_words:
+            self.confirmed_words.pop()
+
+    def commit(self, token):
+        self.candidate_letter = None
+        self.candidate_since = None
+        if token.lower() == DELETE_SIGN_LABEL:
+            self.last_committed_letter = token
+            self.delete_previous()
+        elif len(token) == 1 and token.isdigit():
+            self.keep_letters()
+            self.confirmed_words.append(token)
+            self.last_committed_letter = token
+        else:
+            self.letters.append(token)
+            self.last_committed_letter = token
+        return True
+
     def observe(self, letter, now):
         if letter is None:
             self.candidate_letter = None
@@ -117,12 +142,90 @@ class RecognizedSequence:
             return False
 
         if now - self.candidate_since >= STABLE_PREDICTION_SECONDS:
-            self.letters.append(letter)
-            self.last_committed_letter = letter
-            self.candidate_letter = None
-            self.candidate_since = None
-            return True
+            return self.commit(letter)
         return False
+
+
+class NumberSignResolver:
+    def __init__(self):
+        self.pending_number = None
+        self.pending_letter = None
+        self.pending_since = None
+        self.latched_number = None
+        self.latched_letter = None
+
+    def reset(self):
+        self.pending_number = None
+        self.pending_letter = None
+        self.pending_since = None
+        self.latched_number = None
+        self.latched_letter = None
+
+    def update(self, number, letter, now):
+        resolved = []
+        if self.latched_number is not None:
+            if number == self.latched_number or (
+                number is None and letter == self.latched_letter
+            ):
+                return resolved, self.latched_number, True
+            self.latched_number = None
+            self.latched_letter = None
+
+        if self.pending_number is not None:
+            if number == self.pending_number:
+                if now - self.pending_since < NUMBER_SIGN_HOLD_SECONDS:
+                    return resolved, self.pending_letter, True
+                resolved.append(self.pending_number)
+                self.latched_number = self.pending_number
+                self.latched_letter = self.pending_letter
+                self.pending_number = None
+                self.pending_letter = None
+                self.pending_since = None
+                return resolved, number, True
+
+            resolved.append(self.pending_letter)
+            self.pending_number = None
+            self.pending_letter = None
+            self.pending_since = None
+
+        if number is not None:
+            self.pending_number = number
+            self.pending_letter = letter
+            self.pending_since = now
+            return resolved, self.pending_letter, True
+
+        return resolved, letter, False
+
+
+def infer_number_letter_conflicts(signs, predictor):
+    conflicts = {}
+    for label, examples in signs.items():
+        if label not in NUMBER_SIGN_LABELS or not examples:
+            continue
+        letters = Counter(predictor.predict(example)[0] for example in examples)
+        letter, count = letters.most_common(1)[0]
+        if count / len(examples) >= NUMBER_LETTER_MATCH_THRESHOLD:
+            conflicts[label] = letter
+    return conflicts
+
+
+def matching_number_candidate(custom_prediction, asl_letter, conflicts):
+    if (
+        custom_prediction in NUMBER_SIGN_LABELS
+        and conflicts.get(custom_prediction) == asl_letter
+    ):
+        return custom_prediction
+    return None
+
+
+def update_suggestion_after_commit(sequence, word_predictor, now):
+    if not sequence.current_word:
+        return None, None
+    suggestions = word_predictor.suggest(sequence.current_word, limit=1)
+    return (
+        suggestions[0] if suggestions else None,
+        now + WORD_DECISION_SECONDS,
+    )
 
 
 def is_thumbs_up(landmarks, classifier=None):
@@ -231,6 +334,9 @@ def main():
     thumb_classifier = ThumbGestureClassifier()
     custom_signs = CustomSignLibrary()
     custom_classifier = CustomSignClassifier()
+    number_letter_conflicts = infer_number_letter_conflicts(
+        custom_signs.signs, predictor
+    )
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         cap.release()
@@ -247,6 +353,7 @@ def main():
     thumbs_up_handled = False
     frame_buffer = deque(maxlen=NUM_FRAMES)
     prediction_smoother = PredictionSmoother(PREDICTION_SMOOTHING_WINDOWS)
+    number_resolver = NumberSignResolver()
     current_letter = None
     current_confidence = 0.0
     current_is_custom = False
@@ -260,7 +367,7 @@ def main():
     try:
         with create_hand_landmarker() as hand_landmarker:
             print(
-                "Live 26-letter and custom-sign recognition active! "
+                "Live 26-letter, number-sign, and custom-sign recognition active! "
                 "Press 'q' to quit."
             )
             print(
@@ -288,6 +395,22 @@ def main():
                 f"captures {CUSTOM_SIGN_RECORDINGS_PER_SESSION} separate "
                 f"{NUM_FRAMES}-frame examples, then trains the custom classifier."
             )
+            print(
+                "Record number signs with labels 0-9. A number prediction "
+                "matching the ASL letter inferred from its training examples "
+                f"requires a {NUMBER_SIGN_HOLD_SECONDS:.1f}-second hold; "
+                "other alphabet predictions remain letters. "
+                f"Train a custom sign labeled {DELETE_SIGN_LABEL!r} to delete "
+                "the latest item from the recognized text."
+            )
+            if number_letter_conflicts:
+                print(
+                    "Inferred number/ASL overlaps: "
+                    + ", ".join(
+                        f"{number}={letter}"
+                        for number, letter in sorted(number_letter_conflicts.items())
+                    )
+                )
             if custom_classifier.model is None:
                 print("No trained custom-sign classifier is currently loaded.")
             else:
@@ -375,6 +498,11 @@ def main():
                                             f"{sum(counts.values())} examples "
                                             f"across {len(counts)} signs."
                                         )
+                                    number_letter_conflicts = (
+                                        infer_number_letter_conflicts(
+                                            custom_signs.signs, predictor
+                                        )
+                                    )
                                     recording_label = None
                                     recording_deadline = None
                                     recording_count = 0
@@ -395,6 +523,17 @@ def main():
                                     )
 
                         if thumbs_up_detected:
+                            resolved, _, _ = number_resolver.update(
+                                None, None, now
+                            )
+                            for token in resolved:
+                                sequence.commit(token)
+                                active_suggestion, decision_deadline = (
+                                    update_suggestion_after_commit(
+                                        sequence, word_predictor, now
+                                    )
+                                )
+                            number_resolver.reset()
                             frame_buffer.clear()
                             prediction_smoother.reset()
                             current_letter = None
@@ -438,29 +577,103 @@ def main():
                                 probabilities
                             )
                             predicted_index = int(smoothed_probabilities.argmax())
+                            asl_letter = chr(ord("A") + predicted_index)
+                            custom_prediction = None
                             if custom_classifier.model is not None:
-                                current_letter = custom_classifier.predict(
+                                custom_prediction = custom_classifier.predict(
                                     model_features
                                 )
                             else:
-                                current_letter = custom_signs.match(model_features)
-                            current_is_custom = current_letter is not None
-                            if not current_is_custom:
-                                current_letter = chr(ord("A") + predicted_index)
+                                custom_prediction = custom_signs.match(
+                                    model_features
+                                )
+                            conflict_letter = number_letter_conflicts.get(
+                                custom_prediction
+                            )
+                            if conflict_letter is not None:
+                                if asl_letter == conflict_letter:
+                                    number_candidate = matching_number_candidate(
+                                        custom_prediction,
+                                        asl_letter,
+                                        number_letter_conflicts,
+                                    )
+                                    (
+                                        resolved_tokens,
+                                        current_letter,
+                                        number_is_pending,
+                                    ) = number_resolver.update(
+                                        number_candidate, asl_letter, now
+                                    )
+                                    current_is_custom = True
+                                else:
+                                    resolved_tokens, _, _ = (
+                                        number_resolver.update(
+                                            None, asl_letter, now
+                                        )
+                                    )
+                                    number_resolver.reset()
+                                    current_letter = asl_letter
+                                    current_is_custom = False
+                                    number_is_pending = False
+                            elif custom_prediction is not None:
+                                resolved_tokens, _, _ = number_resolver.update(
+                                    None, asl_letter, now
+                                )
+                                number_resolver.reset()
+                                current_letter = custom_prediction
+                                current_is_custom = True
+                                number_is_pending = False
+                            else:
+                                (
+                                    resolved_tokens,
+                                    current_letter,
+                                    number_is_pending,
+                                ) = number_resolver.update(
+                                    None, asl_letter, now
+                                )
+                                current_is_custom = False
+                            for token in resolved_tokens:
+                                sequence.commit(token)
+                                if token.isdigit():
+                                    active_suggestion = None
+                                    decision_deadline = None
+                                else:
+                                    active_suggestion, decision_deadline = (
+                                        update_suggestion_after_commit(
+                                            sequence, word_predictor, now
+                                        )
+                                    )
+                            if current_is_custom:
+                                current_confidence = 0.0
+                            else:
                                 current_confidence = float(
                                     smoothed_probabilities[predicted_index] * 100
                                 )
-                            else:
-                                current_confidence = 0.0
-                            if sequence.observe(current_letter, now):
-                                suggestions = word_predictor.suggest(
-                                    sequence.current_word, limit=1
+                            if (
+                                not number_is_pending
+                                and sequence.observe(current_letter, now)
+                            ):
+                                active_suggestion, decision_deadline = (
+                                    update_suggestion_after_commit(
+                                        sequence, word_predictor, now
+                                    )
                                 )
-                                active_suggestion = (
-                                    suggestions[0] if suggestions else None
-                                )
-                                decision_deadline = now + WORD_DECISION_SECONDS
                     else:
+                        resolved, _, _ = number_resolver.update(
+                            None, None, now
+                        )
+                        for token in resolved:
+                            sequence.commit(token)
+                            if token.isdigit():
+                                active_suggestion = None
+                                decision_deadline = None
+                            else:
+                                active_suggestion, decision_deadline = (
+                                    update_suggestion_after_commit(
+                                        sequence, word_predictor, now
+                                    )
+                                )
+                        number_resolver.reset()
                         frame_buffer.clear()
                         prediction_smoother.reset()
                         current_letter = None
@@ -512,6 +725,18 @@ def main():
                 elif results is None or not results.hand_landmarks:
                     display_text = "No hand detected"
                     color = (0, 165, 255)
+                elif number_resolver.pending_number is not None:
+                    remaining = max(
+                        0.0,
+                        NUMBER_SIGN_HOLD_SECONDS
+                        - (now - number_resolver.pending_since),
+                    )
+                    display_text = (
+                        f"Current: {current_letter} (hold for "
+                        f"{number_resolver.pending_number}: "
+                        f"{remaining:.1f}s)"
+                    )
+                    color = (0, 255, 0)
                 elif sequence.current_word:
                     display_text = f"Spelling: {sequence.current_word}"
                     color = (0, 200, 255)
