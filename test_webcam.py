@@ -4,9 +4,8 @@ from types import SimpleNamespace
 from webcam import (
     NumberSignResolver,
     RecognizedSequence,
-    infer_number_letter_conflicts,
     is_thumbs_up,
-    matching_number_candidate,
+    normalize_custom_sign_label,
 )
 
 
@@ -55,6 +54,61 @@ class RecognizedSequenceTests(unittest.TestCase):
         previous_word.commit("delete")
         self.assertEqual(previous_word.text, "")
 
+    def test_del_alias_is_canonicalized_as_delete(self):
+        sequence = RecognizedSequence()
+        sequence.letters.extend(("C", "A"))
+
+        sequence.commit(normalize_custom_sign_label("del"))
+
+        self.assertEqual(sequence.current_word, "c")
+
+    def test_holding_delete_repeats_once_per_two_seconds(self):
+        sequence = RecognizedSequence()
+        sequence.confirmed_words.append("hello")
+        sequence.letters.extend(("C", "A"))
+
+        self.assertFalse(sequence.observe("delete", 1.0))
+        self.assertFalse(sequence.observe("delete", 2.99))
+        self.assertTrue(sequence.observe("delete", 3.0))
+        self.assertEqual(sequence.current_word, "c")
+
+        self.assertFalse(sequence.observe("del", 4.99))
+        self.assertTrue(sequence.observe("delete", 5.0))
+        self.assertEqual(sequence.text, "hello")
+
+        self.assertFalse(sequence.observe("delete", 6.99))
+        self.assertTrue(sequence.observe("delete", 7.0))
+        self.assertEqual(sequence.text, "")
+
+    def test_keep_letters_does_not_restart_an_active_delete_hold(self):
+        sequence = RecognizedSequence()
+        sequence.letters.append("A")
+        sequence.observe("delete", 1.0)
+
+        sequence.keep_letters()
+
+        self.assertEqual(sequence.delete_hold_remaining(2.0), 1.0)
+        self.assertTrue(sequence.observe("delete", 3.0))
+        self.assertEqual(sequence.text, "")
+
+    def test_delete_countdown_is_safe_without_an_active_timer(self):
+        sequence = RecognizedSequence()
+
+        self.assertIsNone(sequence.delete_hold_remaining(1.0))
+
+    def test_brief_hand_tracking_gap_does_not_restart_delete_hold(self):
+        sequence = RecognizedSequence()
+        sequence.letters.append("A")
+
+        self.assertFalse(sequence.observe("delete", 1.0))
+        self.assertFalse(sequence.observe(None, 2.9))
+        self.assertTrue(sequence.observe("delete", 3.0))
+        self.assertEqual(sequence.current_word, "")
+
+    def test_delete_aliases_share_a_stable_prediction_label(self):
+        self.assertEqual(normalize_custom_sign_label("del"), "delete")
+        self.assertEqual(normalize_custom_sign_label("DELETE"), "delete")
+
     def test_number_is_a_separate_text_item_and_can_be_deleted(self):
         sequence = RecognizedSequence()
         sequence.letters.extend(("C", "A", "T"))
@@ -74,10 +128,10 @@ class NumberSignResolverTests(unittest.TestCase):
         resolved, shown, pending = resolver.update("1", "D", 1.0)
         self.assertEqual((resolved, shown, pending), ([], "D", True))
 
-        resolved, shown, pending = resolver.update("1", "D", 2.49)
+        resolved, shown, pending = resolver.update("1", "D", 2.99)
         self.assertEqual((resolved, shown, pending), ([], "D", True))
 
-        resolved, shown, pending = resolver.update("1", "D", 2.5)
+        resolved, shown, pending = resolver.update("1", "D", 3.0)
         self.assertEqual((resolved, shown, pending), (["1"], "1", True))
 
     def test_sign_change_resolves_pending_number_as_letter(self):
@@ -87,26 +141,6 @@ class NumberSignResolverTests(unittest.TestCase):
         resolved, shown, pending = resolver.update(None, "B", 1.5)
 
         self.assertEqual((resolved, shown, pending), (["O"], "B", False))
-
-
-class NumberLetterConflictTests(unittest.TestCase):
-    def test_infers_consistent_letter_for_a_trained_number(self):
-        class Predictor:
-            def predict(self, sample):
-                return sample, 100.0
-
-        conflicts = infer_number_letter_conflicts(
-            {"0": ["O", "O", "O", "A", "A"], "love": ["A"]},
-            Predictor(),
-        )
-
-        self.assertEqual(conflicts, {"0": "O"})
-
-    def test_ignores_number_prediction_for_a_different_letter(self):
-        conflicts = {"0": "O", "1": "D"}
-
-        self.assertEqual(matching_number_candidate("0", "O", conflicts), "0")
-        self.assertIsNone(matching_number_candidate("0", "A", conflicts))
 
 
 class ThumbsUpDetectionTests(unittest.TestCase):

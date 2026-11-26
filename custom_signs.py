@@ -20,6 +20,7 @@ MATCH_THRESHOLD = 0.25
 SAMPLE_RATE = 15
 CLASSIFIER_FORMAT_VERSION = 1
 CLASSIFIER_CONFIDENCE_THRESHOLD = 0.65
+ACTION_CLASSIFIER_CONFIDENCE_THRESHOLD = 0.28
 
 
 def validate_sign_label(label):
@@ -189,6 +190,27 @@ class CustomSignClassifier:
 
         probabilities = self.model.predict_proba(flattened)[0]
         predicted_index = int(np.argmax(probabilities))
-        if probabilities[predicted_index] < CLASSIFIER_CONFIDENCE_THRESHOLD:
-            return None
-        return str(self.model.classes_[predicted_index])
+        predicted_label = str(self.model.classes_[predicted_index])
+        confidence_threshold = CLASSIFIER_CONFIDENCE_THRESHOLD
+        if (
+            len(predicted_label) == 1
+            and predicted_label in "0123456789"
+        ) or predicted_label.casefold() in {"del", "delete"}:
+            confidence_threshold = ACTION_CLASSIFIER_CONFIDENCE_THRESHOLD
+        if probabilities[predicted_index] < confidence_threshold:
+            number_candidates = [
+                (index, probability)
+                for index, (label, probability) in enumerate(
+                    zip(self.model.classes_, probabilities)
+                )
+                if len(str(label)) == 1
+                and str(label) in "0123456789"
+                and probability >= ACTION_CLASSIFIER_CONFIDENCE_THRESHOLD
+            ]
+            if not number_candidates:
+                return None
+            predicted_index = max(
+                number_candidates, key=lambda candidate: candidate[1]
+            )[0]
+            predicted_label = str(self.model.classes_[predicted_index])
+        return predicted_label

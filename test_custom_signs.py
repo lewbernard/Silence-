@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 
-from custom_signs import CustomSignLibrary
+from custom_signs import CustomSignClassifier, CustomSignLibrary
 from sequence_dataset import FEATURES_PER_FRAME, NUM_FRAMES, POSE_FEATURES_PER_FRAME
 
 
@@ -45,6 +45,61 @@ class CustomSignLibraryTests(unittest.TestCase):
 
             with self.assertRaises(ValueError):
                 library.add("hello", np.zeros((2, 2), dtype=np.float32))
+
+
+class CustomSignClassifierConfidenceTests(unittest.TestCase):
+    class ProbabilityModel:
+        def __init__(self, labels, probabilities):
+            self.classes_ = np.asarray(labels)
+            self.probabilities = probabilities
+
+        def predict_proba(self, values):
+            return np.tile(self.probabilities, (len(values), 1))
+
+    @staticmethod
+    def classifier_for(labels, probabilities):
+        classifier = CustomSignClassifier(path="unused.joblib")
+        classifier.model = CustomSignClassifierConfidenceTests.ProbabilityModel(
+            labels, probabilities
+        )
+        classifier.model_type = "svm"
+        return classifier
+
+    def test_accepts_low_confidence_number_prediction_for_hold_resolution(self):
+        classifier = self.classifier_for(
+            ["0", "other-1", "other-2", "other-3", "other-4"],
+            [0.3, 0.175, 0.175, 0.175, 0.175],
+        )
+        sequence = np.zeros((NUM_FRAMES, FEATURES_PER_FRAME), dtype=np.float32)
+
+        self.assertEqual(classifier.predict(sequence), "0")
+
+    def test_prefers_number_candidate_over_confused_letter_class(self):
+        classifier = self.classifier_for(
+            ["o", "0", "other-1", "other-2", "other-3", "other-4"],
+            [0.53, 0.3, 0.05, 0.05, 0.04, 0.03],
+        )
+        sequence = np.zeros((NUM_FRAMES, FEATURES_PER_FRAME), dtype=np.float32)
+
+        self.assertEqual(classifier.predict(sequence), "0")
+
+    def test_accepts_low_confidence_delete_alias(self):
+        classifier = self.classifier_for(
+            ["del", "other-1", "other-2", "other-3", "other-4"],
+            [0.3, 0.175, 0.175, 0.175, 0.175],
+        )
+        sequence = np.zeros((NUM_FRAMES, FEATURES_PER_FRAME), dtype=np.float32)
+
+        self.assertEqual(classifier.predict(sequence), "del")
+
+    def test_keeps_standard_threshold_for_other_custom_signs(self):
+        classifier = self.classifier_for(
+            ["hello", "other-1", "other-2", "other-3", "other-4"],
+            [0.3, 0.175, 0.175, 0.175, 0.175],
+        )
+        sequence = np.zeros((NUM_FRAMES, FEATURES_PER_FRAME), dtype=np.float32)
+
+        self.assertIsNone(classifier.predict(sequence))
 
 
 if __name__ == "__main__":

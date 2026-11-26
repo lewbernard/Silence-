@@ -286,9 +286,9 @@ Show one hand to the webcam and hold or perform the sign.
 Press `c` in live recognition and enter a label from `0` through `9`.
 
 - Record 10 repetitions for each number sign.
-- If a number sign resembles an ASL letter, the number is held for 1.5 seconds before it is committed.
+- Number predictions are held for 2 seconds before they are committed.
 - Holding the gesture longer resolves it as a number.
-- Performing a different gesture resolves the result as the detected letter.
+- Performing a different gesture resolves the pending result as a letter.
 
 ### 8.5 Custom Signs
 
@@ -309,10 +309,12 @@ Record at least five examples per custom sign before manually training multiple 
 
 ### 8.6 Delete Gesture
 
-Record a custom sign with the exact label `delete`, then perform it while using live recognition. It removes:
+Record a custom sign labeled `delete` or `del`, then perform it while using live recognition. It removes:
 
 - The latest letter in the current word, or
 - The latest confirmed word or number when no letters are in the current word
+
+Hold the delete sign continuously. One item is deleted every 2 seconds, with a countdown shown on screen.
 
 ---
 
@@ -399,7 +401,7 @@ Generated training datasets and local models should be managed carefully because
 - Recognition quality depends on lighting, webcam position, hand size, and user consistency
 - The project currently recognizes one hand
 - ASL signs that are highly similar visually may require more balanced training samples
-- Number/letter ambiguity is resolved using user hold timing and custom-sign conflicts
+- Number predictions require a sustained hold before they are committed; brief hand-tracking gaps are tolerated
 - Word suggestions use a static English dictionary and confirmation ranking
 - The included pretrained models reflect the available dataset and may require retraining for better personal or regional performance
 
